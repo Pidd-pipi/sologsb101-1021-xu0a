@@ -71,7 +71,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | `/#/designs` | 印稿设计与释文 | 朱文白文、边框式样与章法备注录入，标记采用稿（同石采用稿唯一） | Design、Stone |
 | `/#/carve` | 刻制工序看板 | 按印稿列出刀法步骤、拖拽或上下移排序、批量完成；全部完成回写印石为「已刻」 | Carve、Design |
 | `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果 | Impression、Design |
-| `/#/catalog` | 印谱汇总与导出 | 排序重编号、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
+| `/#/catalog` | 印谱汇总与分卷制版 | 排序重编号（自动回填卷号，每卷 12 方）、收录状态切换、印谱清单生成、锁版导出与厂方回传逐条对账（留复核 / 超容量拒绝 / 失败回滚重试）、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
 
 未知路径由 `routes/NotFound.svelte` 给出友好空态（不白屏）。筛选条件写入 hash query（`?kw=&stoneType=&knobStyle=` 等），刷新后可完整还原。
 
@@ -85,9 +85,18 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | Design 印稿 | `src/lib/types/design.ts` | `id` `stoneId` `sealText` `annotation` `style`（朱文/白文） `borderStyle`（无框/双边/借边/瓦当） `layoutNote` `adopted` | 同石多稿，采用稿唯一，采用后带出到刻制与钤印 |
 | Carve 刻制工序 | `src/lib/types/carve.ts` | `id` `designId` `seq` `knifeMethod`（冲刀/切刀/双刀/修整） `minutes` `operator` `state`（未开始/进行中/已完成） | 拖拽调序，全部完成即回写印石为已刻 |
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
-| Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
+| Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `volumeNo`（卷号，每卷 12 方） `included`（待收录/已收录/不收录） `note` `review`（留待复核标记及厂方回传版本） | 调整排序后自动重编号、重排卷号并汇总已收录方数 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
+数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v3`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）；`v3` 为装订厂分卷制版增加 `catalogs.volumeNo` 索引与 `review` 复核标记，旧数据没有卷号时按现有顺序以每卷 12 方回填默认卷（导入旧版 JSON 备份时同样规整）。
+
+### 装订厂分卷制版与回传对账（v3 新增）
+
+- **每卷 12 方**：`PLATE_VOLUME_SIZE = 12`，卷号由排序号推导（`resequence()` 在移动 / 删除后统一重排序号与卷号）。
+- **锁版导出**：锁版先把卷号回填落库，再把逐条基线（id / orderNo / volumeNo / included / note）连同 `lockedAt` 存入 localStorage（`gbsealcarve:plate-lock`），并导出制版清单 JSON（厂方可另取 TXT 版核对）。
+- **逐条对账**（`utils/catalog.ts` 的 `reconcilePlateReturn()`）：回传必须带回相同的 `lockedAt` 与各条 id；锁版后本地动过对账字段且厂方版本与本地不同的条目**双方留待复核，本地绝不被后到数据覆盖**；厂方缺条、厂方多出的条目同样挂 `review` 标记。复核面板可逐条「保留本地 / 采用厂方版本」。
+- **容量拦截**：待写入集合中任一卷超过 12 方即**整批拒绝写入**，错误信息指出卷号（如「第 1 卷超过每卷 12 方」）；回传原文留存，修正后可直接重试。
+- **失败回滚重试**：入库前把应用前完整清单快照存入 localStorage（`gbsealcarve:plate-rollback`），入库异常自动回滚；页面也可手动「退回应用前清单」，并用留存的回传原文（`gbsealcarve:plate-return`）重试。
+- **汇总联动**：印谱条目经 Dexie `liveQuery` 订阅，收录状态一改动，印谱汇总方数（`summarizeCatalog()`）与印石台账卡片的「谱录方数」（`buildStoneStats()`）即时重算。
 
 ---
 
@@ -100,9 +109,9 @@ sologsb101-1021/
 │   │   ├── lib/
 │   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts
 │   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts
-│   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
+│   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte PlateReviewPanel.svelte
 │   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts
-│   │   │   ├── utils/            # stone.ts db.ts export.ts
+│   │   │   ├── utils/            # stone.ts db.ts export.ts catalog.ts plate.ts
 │   │   │   └── router/           # index.ts（路由表 + 导航项）
 │   │   ├── routes/               # stones/+page.svelte designs/+page.svelte carve/+page.svelte
 │   │   │                         # impressions/+page.svelte catalog/+page.svelte NotFound.svelte
@@ -128,8 +137,8 @@ sologsb101-1021/
 ## 七、数据存储说明
 
 - **IndexedDB（Dexie，数据库名 `gbsealcarve`）**：5 张业务表 `stones` / `designs` / `carves` / `impressions` / `catalogs`，由 `src/lib/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stone → Design → Carve / Impression，另有 Stone → Catalog，固定 id 如 `stone_01`、`design_0101`、`carve_010101`），播种幂等，保证每个页面打开都有内容。
-- **localStorage**：仅存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿）。
-- **备份**：`/catalog` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有印谱清单 TXT 与钤印台账 CSV。
+- **localStorage**：仅存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿），以及分卷制版会话 `gbsealcarve:plate-lock`（锁版基线）、`gbsealcarve:plate-return`（最近回传原文，失败重试用）、`gbsealcarve:plate-rollback`（应用前清单快照，回滚用）、`gbsealcarve:plate-report`（最近入库报告）。
+- **备份**：`/catalog` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性、并为旧版备份回填卷号，覆盖导入前二次确认；另有印谱清单 TXT、送装订厂制版清单（JSON / TXT）与钤印台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

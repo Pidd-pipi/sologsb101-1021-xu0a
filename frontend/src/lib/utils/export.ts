@@ -5,12 +5,15 @@
 import type { Stone } from '$lib/types/stone';
 import type { Design } from '$lib/types/design';
 import type { Impression } from '$lib/types/impression';
-import type { Catalog } from '$lib/types/catalog';
 import type { Carve } from '$lib/types/carve';
 import { STONE_TYPE_LABEL, KNOB_STYLE_LABEL } from '$lib/types/stone';
 import { DESIGN_STYLE_LABEL, BORDER_STYLE_LABEL } from '$lib/types/design';
 import { GRADE_LABEL, PAPER_KIND_LABEL, PRESSURE_LABEL } from '$lib/types/impression';
-import { INCLUDED_LABEL } from '$lib/types/catalog';
+import {
+  INCLUDED_LABEL,
+  type Catalog,
+  type PlateHandoffFile,
+} from '$lib/types/catalog';
 import { KNIFE_METHOD_LABEL, CARVE_STATE_LABEL } from '$lib/types/carve';
 import { describeSize } from './stone';
 import type { SealCarveSnapshot } from './db';
@@ -164,4 +167,66 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
   return false;
+}
+
+/* ------------------------ 装订厂分卷制版：制版清单导出 ------------------------ */
+
+/** 制版清单 JSON（锁版时产出），返回文件名 */
+export function exportPlateHandoffJson(handoff: PlateHandoffFile): string {
+  const filename = `篆刻印谱制版清单-${stampSuffix()}.json`;
+  download(filename, JSON.stringify(handoff, null, 2), 'application/json;charset=utf-8');
+  return filename;
+}
+
+/** 制版清单文本：分卷逐条列出，供装订厂照单核对 */
+export function buildPlateHandoffText(handoff: PlateHandoffFile, context: SealCatalogContext): string {
+  const lines: string[] = [
+    '篆刻印谱制版清单（送装订厂）',
+    `锁版时间：${new Date(handoff.lockedAt).toLocaleString('zh-CN')}`,
+    `每卷 ${handoff.volumeSize} 方，共 ${handoff.volumes} 卷，合计 ${handoff.entries.length} 方`,
+    '回传请保持 lockedAt 与各条 id 不变，仅改 orderNo / volumeNo / included / note。',
+    '',
+  ];
+  const byVolume = new Map<number, Catalog[]>();
+  handoff.entries.forEach((entry) => {
+    const catalog: Catalog =
+      context.catalogs.find((item) => item.id === entry.id) ??
+      ({
+        id: entry.id,
+        stoneId: '',
+        designId: '',
+        orderNo: entry.orderNo,
+        volumeNo: entry.volumeNo,
+        included: entry.included,
+        note: entry.note,
+        review: null,
+        createdAt: 0,
+        updatedAt: 0,
+      } as Catalog);
+    const list = byVolume.get(entry.volumeNo) ?? [];
+    list.push(catalog);
+    byVolume.set(entry.volumeNo, list);
+  });
+  [...byVolume.keys()].sort((a, b) => a - b).forEach((volumeNo) => {
+    const list = byVolume.get(volumeNo) ?? [];
+    lines.push(`【第 ${volumeNo} 卷】（${list.length}/${handoff.volumeSize} 方）`);
+    list
+      .slice()
+      .sort((a, b) => a.orderNo - b.orderNo)
+      .forEach((catalog) => {
+        const design = context.designs.find((item) => item.id === catalog.designId);
+        lines.push(
+          `第 ${catalog.orderNo} 方　id=${catalog.id}　${INCLUDED_LABEL[catalog.included]}　${design?.sealText ?? '（印稿已删除）'}`,
+        );
+      });
+    lines.push('');
+  });
+  return lines.join('\n');
+}
+
+/** 导出制版清单文本，返回文件名 */
+export function exportPlateHandoffText(handoff: PlateHandoffFile, context: SealCatalogContext): string {
+  const filename = `篆刻印谱制版清单-${stampSuffix()}.txt`;
+  download(filename, buildPlateHandoffText(handoff, context), 'text/plain;charset=utf-8');
+  return filename;
 }

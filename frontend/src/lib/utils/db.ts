@@ -12,12 +12,13 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import { PLATE_VOLUME_SIZE } from '$lib/types/catalog';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -131,6 +132,42 @@ class SealCarveDatabase extends Dexie {
             if (!catalog.included) catalog.included = 'pending';
           });
       });
+
+    // v3：印谱分卷制版 —— catalogs 增加 volumeNo 索引，旧数据按现有顺序回填默认卷号
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, volumeNo, included, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const rows = await tx.table<Catalog>('catalogs').toArray();
+        const sorted = [...rows].sort((a, b) =>
+          a.orderNo === b.orderNo ? a.createdAt - b.createdAt : a.orderNo - b.orderNo,
+        );
+        const fixed = new Map<string, number>();
+        sorted.forEach((catalog, index) => {
+          const volumeNo = Math.floor(index / PLATE_VOLUME_SIZE) + 1;
+          if (
+            typeof catalog.volumeNo !== 'number' ||
+            !Number.isInteger(catalog.volumeNo) ||
+            catalog.volumeNo <= 0
+          ) {
+            fixed.set(catalog.id, volumeNo);
+          }
+        });
+        if (fixed.size > 0) {
+          await tx
+            .table<Catalog>('catalogs')
+            .toCollection()
+            .modify((catalog) => {
+              const volumeNo = fixed.get(catalog.id);
+              if (volumeNo !== undefined) catalog.volumeNo = volumeNo;
+            });
+        }
+      });
   }
 }
 
@@ -235,10 +272,10 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const catalogs: Catalog[] = [
-    { id: 'cata_0101', stoneId: 'stone_01', designId: 'design_0101', orderNo: 1, included: 'included', note: '印谱首方', createdAt: now - day * 50, updatedAt: now - day * 50 },
-    { id: 'cata_0201', stoneId: 'stone_02', designId: 'design_0201', orderNo: 2, included: 'pending', note: '待修整完稿后收录', createdAt: now - day * 30, updatedAt: now - day * 6 },
-    { id: 'cata_0301', stoneId: 'stone_03', designId: 'design_0301', orderNo: 3, included: 'included', note: '鸡血石代表方', createdAt: now - day * 95, updatedAt: now - day * 95 },
-    { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 4, included: 'excluded', note: '此稿暂不收录，另拟新稿', createdAt: now - day * 10, updatedAt: now - day * 2 },
+    { id: 'cata_0101', stoneId: 'stone_01', designId: 'design_0101', orderNo: 1, volumeNo: 1, included: 'included', note: '印谱首方', review: null, createdAt: now - day * 50, updatedAt: now - day * 50 },
+    { id: 'cata_0201', stoneId: 'stone_02', designId: 'design_0201', orderNo: 2, volumeNo: 1, included: 'pending', note: '待修整完稿后收录', review: null, createdAt: now - day * 30, updatedAt: now - day * 6 },
+    { id: 'cata_0301', stoneId: 'stone_03', designId: 'design_0301', orderNo: 3, volumeNo: 1, included: 'included', note: '鸡血石代表方', review: null, createdAt: now - day * 95, updatedAt: now - day * 95 },
+    { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 4, volumeNo: 1, included: 'excluded', note: '此稿暂不收录，另拟新稿', review: null, createdAt: now - day * 10, updatedAt: now - day * 2 },
   ];
 
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
@@ -307,7 +344,28 @@ export async function clearAllTables(): Promise<void> {
   });
 }
 
-export async function importSnapshot(snapshot: SealCarveSnapshot): Promise<void> {
+/** 导入时规整旧版备份：旧数据没有卷号则按现有顺序回填默认卷 */
+export function normalizeSnapshot(snapshot: SealCarveSnapshot): SealCarveSnapshot {
+  const sorted = [...snapshot.catalogs].sort((a, b) =>
+    a.orderNo === b.orderNo ? (a.createdAt ?? 0) - (b.createdAt ?? 0) : a.orderNo - b.orderNo,
+  );
+  const catalogs = sorted.map((catalog, index) => {
+    const next: Catalog = { ...catalog };
+    if (
+      typeof next.volumeNo !== 'number' ||
+      !Number.isInteger(next.volumeNo) ||
+      next.volumeNo <= 0
+    ) {
+      next.volumeNo = Math.floor(index / PLATE_VOLUME_SIZE) + 1;
+    }
+    if (next.review === undefined) next.review = null;
+    return next;
+  });
+  return { ...snapshot, catalogs };
+}
+
+export async function importSnapshot(input: SealCarveSnapshot): Promise<void> {
+  const snapshot = normalizeSnapshot(input);
   await clearAllTables();
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
     await db.stones.bulkPut(snapshot.stones);
