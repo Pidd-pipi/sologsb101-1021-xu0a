@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据结构版本号与升级迁移逻辑（v1 初版；v2 为 impressions 增加 grade 索引、
- *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段）
+ *   为 catalogs 增加 orderNo 索引并回填历史记录缺失字段；v3 为 catalogs 增加
+ *   volumeNo 卷号字段并按现有顺序回填默认卷，每卷十二方）
  * - 五张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
@@ -12,12 +13,13 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import { volumeNoForOrder } from '$lib/types/catalog';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -99,7 +101,7 @@ class SealCarveDatabase extends Dexie {
     });
 
     // v2：补充检索索引并回填历史记录缺失字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
         designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
@@ -130,6 +132,45 @@ class SealCarveDatabase extends Dexie {
             if (typeof catalog.orderNo !== 'number' || catalog.orderNo <= 0) catalog.orderNo = 1;
             if (!catalog.included) catalog.included = 'pending';
           });
+      });
+
+    // v3：catalogs 增加 volumeNo 卷号字段，并为旧数据按当前顺序回填默认卷（每卷十二方）
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, volumeNo, included, reviewState, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const rows = await tx.table<Catalog>('catalogs').toArray();
+        const sorted = [...rows].sort((a, b) =>
+          a.orderNo === b.orderNo ? a.createdAt - b.createdAt : a.orderNo - b.orderNo,
+        );
+        await tx
+          .table<Catalog>('catalogs')
+          .toCollection()
+          .modify((catalog) => {
+            if (typeof catalog.volumeNo !== 'number' || catalog.volumeNo <= 0) {
+              catalog.volumeNo = volumeNoForOrder(catalog.orderNo);
+            }
+            if (catalog.reviewState !== 'pending') catalog.reviewState = 'none';
+          });
+        // 保证卷号按当前顺序连续（旧数据可能缺号）
+        const needRenumber = sorted.some(
+          (catalog, index) => catalog.volumeNo !== volumeNoForOrder(index + 1),
+        );
+        if (needRenumber) {
+          await tx.table<Catalog>('catalogs').bulkPut(
+            sorted.map((catalog, index) => ({
+              ...catalog,
+              orderNo: index + 1,
+              volumeNo: volumeNoForOrder(index + 1),
+              updatedAt: Date.now(),
+            })),
+          );
+        }
       });
   }
 }
@@ -235,10 +276,10 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const catalogs: Catalog[] = [
-    { id: 'cata_0101', stoneId: 'stone_01', designId: 'design_0101', orderNo: 1, included: 'included', note: '印谱首方', createdAt: now - day * 50, updatedAt: now - day * 50 },
-    { id: 'cata_0201', stoneId: 'stone_02', designId: 'design_0201', orderNo: 2, included: 'pending', note: '待修整完稿后收录', createdAt: now - day * 30, updatedAt: now - day * 6 },
-    { id: 'cata_0301', stoneId: 'stone_03', designId: 'design_0301', orderNo: 3, included: 'included', note: '鸡血石代表方', createdAt: now - day * 95, updatedAt: now - day * 95 },
-    { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 4, included: 'excluded', note: '此稿暂不收录，另拟新稿', createdAt: now - day * 10, updatedAt: now - day * 2 },
+    { id: 'cata_0101', stoneId: 'stone_01', designId: 'design_0101', orderNo: 1, volumeNo: 1, included: 'included', reviewState: 'none', note: '印谱首方', createdAt: now - day * 50, updatedAt: now - day * 50 },
+    { id: 'cata_0201', stoneId: 'stone_02', designId: 'design_0201', orderNo: 2, volumeNo: 1, included: 'pending', reviewState: 'none', note: '待修整完稿后收录', createdAt: now - day * 30, updatedAt: now - day * 6 },
+    { id: 'cata_0301', stoneId: 'stone_03', designId: 'design_0301', orderNo: 3, volumeNo: 1, included: 'included', reviewState: 'none', note: '鸡血石代表方', createdAt: now - day * 95, updatedAt: now - day * 95 },
+    { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 4, volumeNo: 1, included: 'excluded', reviewState: 'none', note: '此稿暂不收录，另拟新稿', createdAt: now - day * 10, updatedAt: now - day * 2 },
   ];
 
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
@@ -314,7 +355,16 @@ export async function importSnapshot(snapshot: SealCarveSnapshot): Promise<void>
     await db.designs.bulkPut(snapshot.designs);
     await db.carves.bulkPut(snapshot.carves);
     await db.impressions.bulkPut(snapshot.impressions);
-    await db.catalogs.bulkPut(snapshot.catalogs);
+    // 旧备份可能缺少 volumeNo / reviewState，导入后按当前顺序回填默认卷
+    const normalizedCatalogs: Catalog[] = snapshot.catalogs.map((catalog) => ({
+      ...catalog,
+      volumeNo:
+        typeof catalog.volumeNo === 'number' && catalog.volumeNo > 0
+          ? catalog.volumeNo
+          : volumeNoForOrder(catalog.orderNo),
+      reviewState: catalog.reviewState === 'pending' ? 'pending' : 'none',
+    }));
+    await db.catalogs.bulkPut(normalizedCatalogs);
   });
 }
 
